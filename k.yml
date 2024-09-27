@@ -1,13 +1,11 @@
 ---
-- name: Setup Android on a server with ADB and VNC access
+- name: Setup Android-x86 on QEMU VM with ADB and VNC access
   hosts: localhost
   become: true
   vars:
     iso_url: "https://osdn.net/projects/android-x86/releases/download/69249/android-x86_64-9.0-r2.iso"
     iso_file: "/tmp/android-x86_64-9.0-r2.iso"
-    fallback_iso_url_1: "https://mirror.example.com/android-x86_64-9.0-r2.iso"  # Fallback URL 1
-    fallback_iso_url_2: "https://anothermirror.example.com/android-x86_64-9.0-r2.iso"  # Fallback URL 2
-    fallback_iso_url_3: "https://yetanothermirror.example.com/android-x86_64-9.0-r2.iso"  # Fallback URL 3
+    fallback_iso_url: "https://mirror.example.com/android-x86_64-9.0-r2.iso"  # Fallback URL
     disk_image: "/tmp/android.img"
     disk_size: "75G"
     memory: "4096"
@@ -26,294 +24,131 @@
           - bridge-utils
           - android-tools-adb
           - wget
-          - lsb-release
-          - dmidecode
         state: present
         update_cache: yes
 
-    # Step 2: Check system specifications
-    - name: Gather system specifications
-      command: dmidecode -t system
-      register: system_specs
+    # Step 2: Check Internet Connectivity (Basic Ping Test)
+    - name: Check internet connectivity (ping google.com)
+      command: ping -c 2 google.com
+      register: ping_result
+      failed_when: ping_result.rc != 0
+      ignore_errors: yes
 
-    - name: Parse system specifications
-      set_fact:
-        system_memory: "{{ system_specs.stdout | regex_search('Size: ([0-9]+) MB', '\\1') | int / 1024 }}"
-        system_cpu: "{{ system_specs.stdout | regex_search('Processor Information.*?Version: (.+)', '\\1') }}"
+    - name: Fail playbook if internet is not reachable
+      fail:
+        msg: "Internet connection is required to download the ISO, but it seems unavailable."
+      when: ping_result.rc != 0
 
-    # Step 3: Decide which method to use based on system specifications
-    - name: Decide which method to use
-      set_fact:
-        install_method: "{{ 'waydroid' if system_memory >= 8 else 'anbox' if system_memory >= 4 else 'android-x86' }}"
+    # Step 3: Attempt to download Android-x86 ISO
+    - name: Attempt to download Android-x86 ISO
+      get_url:
+        url: "{{ iso_url }}"
+        dest: "{{ iso_file }}"
+        mode: '0644'
+      register: iso_download_result
+      retries: 3   # Retry 3 times if download fails
+      delay: 10    # Delay 10 seconds between retries
+      ignore_errors: yes
 
-    # Step 4: Install Waydroid if system memory is >= 8GB
-    - name: Install Waydroid
-      block:
-        - name: Add Waydroid repository
-          apt_repository:
-            repo: ppa:waydroid/stable
-            state: present
+    # Step 4: Fallback: If the primary ISO download fails, attempt fallback URL
+    - name: Download fallback Android-x86 ISO if the primary URL fails
+      get_url:
+        url: "{{ fallback_iso_url }}"
+        dest: "{{ iso_file }}"
+        mode: '0644'
+      register: fallback_download_result
+      when: iso_download_result is failed
+      retries: 2   # Retry 2 times on fallback download
+      delay: 10
+      ignore_errors: yes
 
-        - name: Install Waydroid
-          apt:
-            name: waydroid
-            state: present
-            update_cache: yes
+    # Step 5: Manual Alternative: Prompt user for local ISO if both downloads fail
+    - name: Prompt user to provide ISO manually if both URLs fail
+      pause:
+        prompt: "Both download attempts failed. Please manually download the Android-x86 ISO and place it at {{ iso_file }}. Press Enter to continue when done."
+      when: iso_download_result is failed and fallback_download_result is failed
 
-        - name: Initialize Waydroid
-          command: waydroid init
+    # Step 6: Ensure ISO file exists (validate download or manual supply)
+    - name: Ensure the Android-x86 ISO exists
+      stat:
+        path: "{{ iso_file }}"
+      register: iso_file_check
 
-        - name: Start Waydroid session
-          command: waydroid session start
+    # Step 7: Fail explicitly if no supported download method worked
+    - name: Fail if no supported method to retrieve ISO
+      fail:
+        msg: "No supported method to obtain the Android-x86 ISO worked. Both downloads failed, and no manual ISO was provided."
+      when: not iso_file_check.stat.exists
 
-        - name: Install VNC server on Waydroid
-          command: waydroid shell pm install /tmp/{{ vnc_apk }}
+    # Step 8: Create a QEMU disk image for Android-x86
+    - name: Create QEMU disk image for Android-x86
+      command: "qemu-img create -f qcow2 {{ disk_image }} {{ disk_size }}"
 
-        - name: Start VNC server on Waydroid
-          command: waydroid shell am start -n com.bk138.droidvncng/.DroidVNC
+    # Step 9: Start the QEMU VM for installation (manual installation by user)
+    - name: Start QEMU VM for installation (User will install Android-x86 manually)
+      command: >
+        qemu-system-x86_64
+        -enable-kvm
+        -m {{ memory }}
+        -smp {{ cpu }}
+        -hda {{ disk_image }}
+        -cdrom {{ iso_file }}
+        -boot d
+        -vga std
+        -usb
+        -device usb-tablet
+      async: 1200  # Allow user 20 minutes to install the OS
+      poll: 0
 
-      when: install_method == 'waydroid'
+    # Step 10: Wait for user to install and reboot
+    - name: Prompt user to complete installation and reboot
+      pause:
+        prompt: "Press Enter after completing the Android-x86 installation and rebooting the VM."
 
-    # Step 5: Install Anbox if system memory is >= 4GB
-    - name: Install Anbox
-      block:
-        - name: Add Anbox repository
-          apt_repository:
-            repo: ppa:morphis/anbox-support
-            state: present
+    # Step 11: Start the QEMU VM with port redirection for ADB
+    - name: Start QEMU VM with ADB access
+      command: >
+        qemu-system-x86_64
+        -enable-kvm
+        -m {{ memory }}
+        -smp {{ cpu }}
+        -hda {{ disk_image }}
+        -vga std
+        -usb
+        -device usb-tablet
+        -redir tcp:5555::5555
+      async: 120
+      poll: 0
 
-        - name: Install Anbox
-          apt:
-            name: anbox
-            state: present
-            update_cache: yes
+    # Step 12: Wait for the VM to boot
+    - name: Wait for the VM to boot
+      pause:
+        seconds: 60
 
-        - name: Initialize Anbox
-          command: anbox system-info
+    # Step 13: Connect via ADB
+    - name: Connect to the VM via ADB
+      command: "adb connect localhost:5555"
 
-        - name: Install VNC server on Anbox
-          command: adb install /tmp/{{ vnc_apk }}
+    # Step 14: Enable root access via ADB
+    - name: Enable root access on the Android VM
+      command: "adb root"
 
-        - name: Start VNC server on Anbox
-          command: adb shell am start -n com.bk138.droidvncng/.DroidVNC
+    # Step 15: Download the VNC server APK
+    - name: Download VNC server APK
+      get_url:
+        url: "{{ vnc_apk_url }}"
+        dest: "/tmp/{{ vnc_apk }}"
+        mode: '0644'
 
-      when: install_method == 'anbox'
+    # Step 16: Install the VNC server APK on Android-x86
+    - name: Install VNC server APK on Android VM
+      command: "adb install /tmp/{{ vnc_apk }}"
 
-    # Step 6: Install Android-x86 if system memory is < 4GB
-    - name: Install Android-x86
-      block:
-        # Step 6.1: Check Internet Connectivity (Basic Ping Test)
-        - name: Check internet connectivity (ping google.com)
-          command: ping -c 2 google.com
-          register: ping_result
-          failed_when: ping_result.rc != 0
-          ignore_errors: yes
+    # Step 17: Start the VNC server on Android-x86
+    - name: Start the VNC server on the Android VM
+      command: "adb shell am start -n com.bk138.droidvncng/.DroidVNC"
 
-        - name: Fail playbook if internet is not reachable
-          fail:
-            msg: "Internet connection is required to download the ISO, but it seems unavailable."
-          when: ping_result.rc != 0
-
-        # Step 6.2: Attempt to download Android-x86 ISO
-        - name: Attempt to download Android-x86 ISO
-          get_url:
-            url: "{{ iso_url }}"
-            dest: "{{ iso_file }}"
-            mode: '0644'
-          register: iso_download_result
-          retries: 3   # Retry 3 times if download fails
-          delay: 10    # Delay 10 seconds between retries
-          ignore_errors: yes
-
-        # Step 6.3: Fallback: If the primary ISO download fails, attempt fallback URLs
-        - name: Download fallback Android-x86 ISO if the primary URL fails
-          get_url:
-            url: "{{ fallback_iso_url_1 }}"
-            dest: "{{ iso_file }}"
-            mode: '0644'
-          when: iso_download_result is failed
-          register: fallback_iso_download_result_1
-          ignore_errors: yes
-
-        - name: Download fallback Android-x86 ISO if the first fallback URL fails
-          get_url:
-            url: "{{ fallback_iso_url_2 }}"
-            dest: "{{ iso_file }}"
-            mode: '0644'
-          when: iso_download_result is failed and fallback_iso_download_result_1 is failed
-          register: fallback_iso_download_result_2
-          ignore_errors: yes
-
-        - name: Download fallback Android-x86 ISO if the second fallback URL fails
-          get_url:
-            url: "{{ fallback_iso_url_3 }}"
-            dest: "{{ iso_file }}"
-            mode: '0644'
-          when: iso_download_result is failed and fallback_iso_download_result_1 is failed and fallback_iso_download_result_2 is failed
-          register: fallback_iso_download_result_3
-          ignore_errors: yes
-
-        # Step 6.4: Manual Alternative: Prompt user for local ISO if all downloads fail
-        - name: Prompt user to provide ISO manually if all URLs fail
-          pause:
-            prompt: "All download attempts failed. Please manually download the Android-x86 ISO and place it at {{ iso_file }}. Press Enter to continue when done."
-          when: iso_download_result is failed and fallback_iso_download_result_1 is failed and fallback_iso_download_result_2 is failed and fallback_iso_download_result_3 is failed
-
-        # Step 6.5: Ensure ISO file exists (validate download or manual supply)
-        - name: Ensure the Android-x86 ISO exists
-          stat:
-            path: "{{ iso_file }}"
-          register: iso_file_check
-
-        - name: Fail if Android-x86 ISO is not present
-          fail:
-            msg: "Android-x86 ISO not found. Please make sure the ISO is located at {{ iso_file }}."
-          when: not iso_file_check.stat.exists
-
-        # Step 6.6: Create a QEMU disk image for Android-x86
-        - name: Create QEMU disk image for Android-x86
-          command: "qemu-img create -f qcow2 {{ disk_image }} {{ disk_size }}"
-
-        # Step 6.7: Start the QEMU VM for installation (manual installation by user)
-        - name: Start QEMU VM for installation (User will install Android-x86 manually)
-          command: >
-            qemu-system-x86_64
-            -enable-kvm
-            -m {{ memory }}
-            -smp {{ cpu }}
-            -hda {{ disk_image }}
-            -cdrom {{ iso_file }}
-            -boot d
-            -vga std
-            -usb
-            -device usb-tablet
-          async: 1200  # Allow user 20 minutes to install the OS
-          poll: 0
-
-        # Step 6.8: Wait for user to install and reboot
-        - name: Prompt user to complete installation and reboot
-          pause:
-            prompt: "Press Enter after completing the Android-x86 installation and rebooting the VM."
-
-        # Step 6.9: Start the QEMU VM with port redirection for ADB
-        - name: Start QEMU VM with ADB access
-          command: >
-            qemu-system-x86_64
-            -enable-kvm
-            -m {{ memory }}
-            -smp {{ cpu }}
-            -hda {{ disk_image }}
-            -vga std
-            -usb
-            -device usb-tablet
-            -redir tcp:5555::5555
-          async: 120
-          poll: 0
-
-        # Step 6.10: Wait for the VM to boot
-        - name: Wait for the VM to boot
-          pause:
-            seconds: 60
-
-        # Step 6.11: Connect via ADB
-        - name: Connect to the VM via ADB
-          command: "adb connect localhost:5555"
-
-        # Step 6.12: Enable root access via ADB
-        - name: Enable root access on the Android VM
-          command: "adb root"
-
-        # Step 6.13: Download the VNC server APK
-        - name: Download VNC server APK
-          get_url:
-            url: "{{ vnc_apk_url }}"
-            dest: "/tmp/{{ vnc_apk }}"
-            mode: '0644'
-
-        # Step 6.14: Install the VNC server APK on Android-x86
-        - name: Install VNC server APK on Android VM
-          command: "adb install /tmp/{{ vnc_apk }}"
-
-        # Step 6.15: Start the VNC server on Android-x86
-        - name: Start the VNC server on the Android VM
-          command: "adb shell am start -n com.bk138.droidvncng/.DroidVNC"
-
-        # Step 6.16: Display VNC connection instructions
-        - name: VNC server running instructions
-          debug:
-            msg: "Android-x86 is now installed. Connect via ADB on port 5555 and VNC using a VNC client."
-
-      when: install_method == 'android-x86'
-
-    # Step 7: Install BlissOS if system memory is >= 4GB
-    - name: Install BlissOS
-      block:
-        - name: Download BlissOS ISO
-          get_url:
-            url: "https://example.com/blissos.iso"  # Replace with actual BlissOS ISO URL
-            dest: "/tmp/blissos.iso"
-            mode: '0644'
-
-        - name: Create QEMU disk image for BlissOS
-          command: "qemu-img create -f qcow2 /tmp/blissos.img 75G"
-
-        - name: Start QEMU VM for BlissOS installation (manual installation by user)
-          command: >
-            qemu-system-x86_64
-            -enable-kvm
-            -m 4096
-            -smp 1
-            -hda /tmp/blissos.img
-            -cdrom /tmp/blissos.iso
-            -boot d
-            -vga std
-            -usb
-            -device usb-tablet
-          async: 1200  # Allow user 20 minutes to install the OS
-          poll: 0
-
-        - name: Prompt user to complete installation and reboot
-          pause:
-            prompt: "Press Enter after completing the BlissOS installation and rebooting the VM."
-
-        - name: Start QEMU VM with ADB access
-          command: >
-            qemu-system-x86_64
-            -enable-kvm
-            -m 4096
-            -smp 1
-            -hda /tmp/blissos.img
-            -vga std
-            -usb
-            -device usb-tablet
-            -redir tcp:5555::5555
-          async: 120
-          poll: 0
-
-        - name: Wait for the VM to boot
-          pause:
-            seconds: 60
-
-        - name: Connect to the VM via ADB
-          command: "adb connect localhost:5555"
-
-        - name: Enable root access on the BlissOS VM
-          command: "adb root"
-
-        - name: Download VNC server APK
-          get_url:
-            url: "{{ vnc_apk_url }}"
-            dest: "/tmp/{{ vnc_apk }}"
-            mode: '0644'
-
-        - name: Install VNC server APK on BlissOS VM
-          command: "adb install /tmp/{{ vnc_apk }}"
-
-        - name: Start the VNC server on the BlissOS VM
-          command: "adb shell am start -n com.bk138.droidvncng/.DroidVNC"
-
-        - name: VNC server running instructions
-          debug:
-            msg: "BlissOS is now installed. Connect via ADB on port 5555 and VNC using a VNC client."
-
-      when: install_method == 'blissos'
+    # Step 18: Display VNC connection instructions
+    - name: VNC server running instructions
+      debug:
+        msg: "Android-x86 is now installed. Connect via ADB on port 5555 and VNC using a VNC client."
