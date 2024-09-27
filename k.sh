@@ -1,55 +1,50 @@
-
 #!/bin/bash
 
-# Ensure necessary packages are installed
-sudo apt update && sudo apt install qemu-system-arm virtmanager bridge-utils vnc android-x86-64-tools -y
+# Update package list and install necessary tools
+sudo apt update
+sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils android-tools-adb wget
 
-# Create a new virtual machine
-virt-manager --new
+# Define variables
+ISO_URL="https://www.fosshub.com/Android-x86.html?dwl=android-x86_64-9.0-r2.iso"
+ISO_FILE="android-x86_64-9.0-r2.iso"
+DISK_IMAGE="android.img"
+DISK_SIZE="75G"
+MEMORY="4096"
+CPU="1"
 
-# Configure the VM as follows:
-# - Name: "AndroidServer"
-# - Type: "Custom"
-# - Memory: 2GB (adjust as needed)
-# - CPU: 1 core (adjust as needed)
-# - Boot device: "CDROM"
-# - CDROM device: "Android x86 ISO" (choose a suitable Android 9 x86 ISO)
-# - Network: "Bridged" (connect to your network)
-# - Storage: Create a new disk (e.g., 10GB)
+# Download the Android-x86 ISO
+wget -O $ISO_FILE $ISO_URL
 
-# Start the VM
-virt-manager
+# Create a disk image for Android-x86
+qemu-img create -f qcow2 $DISK_IMAGE $DISK_SIZE
 
-# Once the VM is booted into Android, install the necessary tools:
-# - ADB: `sudo apt install adb`
-# - Fastboot: `sudo apt install fastboot`
-# - VNC server: `sudo apt install vnc`
+# Start the QEMU VM for installation
+echo "Starting QEMU for Android-x86 installation. Follow the on-screen instructions to install Android-x86."
+qemu-system-x86_64 -enable-kvm -m $MEMORY -smp $CPU -hda $DISK_IMAGE -cdrom $ISO_FILE -boot d -vga std -usb -device usb-tablet
 
-# Configure VNC server (e.g., set password, enable remote access)
+# Wait for the user to complete the installation and reboot the VM
+read -p "Press Enter after the installation is complete and the VM has rebooted."
 
-# Create a script to start the Android emulator with VNC:
-cat > start_android_emulator.sh <<EOF
-#!/bin/bash
+# Start the QEMU VM with port redirection for ADB
+echo "Starting QEMU with port redirection for ADB."
+qemu-system-x86_64 -enable-kvm -m $MEMORY -smp $CPU -hda $DISK_IMAGE -vga std -usb -device usb-tablet -redir tcp:5555::5555 &
 
-# VNC port
-vnc_port=5900
+# Wait for the VM to boot
+sleep 60
 
-# Create a new Android instance with reduced memory and swap
-android-x86-64-tools create -n android_x86 -m 2048 -s 1024
+# Connect via ADB
+adb connect localhost:5555
 
-# Start the Android emulator
-emulator -avd android_x86 -gpu swiftshader -netcfg no-global-address -no-boot-menu -qemu -console null -no-audio -no-cursor -vnc display=$vnc_port
+# Enable root access
+adb root
 
-# Access the Android emulator via VNC
-vncviewer localhost:$vnc_port
-EOF
+# Download and install VNC server APK
+VNC_APK="droidVNC-NG-1.2.0.apk"
+wget https://github.com/bk138/droidVNC-NG/releases/download/v1.2.0/$VNC_APK
+adb install $VNC_APK
 
-# Make the script executable
-chmod +x start_android_emulator.sh
+# Start VNC server
+adb shell am start -n com.bk138.droidvncng/.DroidVNC
 
-# Run the script to start the Android emulator with VNC
-./start_android_emulator.sh
-
-# Install Magic on the Android emulator (follow Magic's installation instructions)
-
-# Root the Android emulator (follow rooting instructions for your Android x86 image)
+echo "Android-x86 is now installed and configured with ADB and VNC for remote access."
+echo "Use a VNC client to connect to the VNC server running on your server."
